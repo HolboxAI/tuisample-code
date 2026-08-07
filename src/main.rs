@@ -86,8 +86,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     theme::init(theme::resolve_mode(&config.ui.theme));
 
     // Enrol before the terminal is touched, so a slow or unreachable gateway is
-    // an ordinary line on stdout rather than a frozen alternate screen.
-    let free_tier_status = enrol_free_tier(&mut config).await;
+    // an ordinary line on stdout rather than a frozen alternate screen. This
+    // only blocks for a brand-new install (it needs a device token before the
+    // app is usable at all) -- an already-enrolled device's budget is fetched
+    // after the terminal comes up instead, see `refresh_budget_on_start`.
+    let (free_tier_status, refresh_budget_on_start) = enrol_free_tier(&mut config).await;
     let (workspace, workspace_status) = open_workspace(&config);
 
     // Detached, not awaited: a slow or unreachable telemetry endpoint must
@@ -99,11 +102,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let enhanced = setup_terminal()?;
     install_panic_hook(enhanced);
 
+    // Discard any keystrokes the terminal buffered while we were blocked above,
+    // typed before raw mode existed to consume them. Left alone, enabling raw
+    // mode releases them straight into the event loop, where they land as
+    // "typed" characters in the input box the instant the UI appears.
+    while event::poll(Duration::from_millis(0))? {
+        let _ = event::read()?;
+    }
+
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config);
     app.free_tier_status = free_tier_status;
+    app.refresh_budget = refresh_budget_on_start;
     // Loaded before the first prompt so a limit already spent today is in force
     // from the start, not after the first request slips through.
     if app.config.quota.enabled {
@@ -365,27 +377,26 @@ async fn run_app<B: ratatui::backend::Backend>(
 }
 
 /// Enrol in the free tier if this install needs it, returning a line for the
-/// welcome screen.
+/// welcome screen and whether the event loop still owes it a budget fetch.
 ///
 /// Every failure degrades to a notice rather than an error: offline, blocked by
 /// a proxy, or gateway down -- the app still starts, and still works for anyone
 /// with their own key. An empty string means there is nothing worth saying.
-async fn enrol_free_tier(config: &mut Config) -> String {
+async fn enrol_free_tier(config: &mut Config) -> (String, bool) {
     if freetier::is_free_tier(config) {
-        // Ask rather than remember: the limit is a server-side setting that can
-        // change at any time, so anything cached at enrolment would be a number
-        // that only looks authoritative.
-        return match freetier::fetch_budget(config).await {
-            Ok(budget) => budget.summary(),
-            Err(_) => format!("Free tier — {}", config.llm.model),
-        };
+        // Deferred to `run_app`'s existing `refresh_budget` handling (the same
+        // path a mid-session refresh uses) instead of awaited here: this is
+        // the common case on every ordinary launch, and a slow or unreachable
+        // gateway must not hold the terminal back just to fetch a number the
+        // welcome screen can equally well pick up a moment later.
+        return (format!("Free tier — {}", config.llm.model), true);
     }
     if !freetier::should_register(config) {
-        return String::new();
+        return (String::new(), false);
     }
 
     println!("Setting up the free tier (no sign-in needed)…");
-    match freetier::register(config).await {
+    let status = match freetier::register(config).await {
         Ok(enrolment) => {
             // Persist so the next launch reuses this device rather than enrolling
             // again -- and so the budget is not reset by a restart.
@@ -401,7 +412,8 @@ async fn enrol_free_tier(config: &mut Config) -> String {
             eprintln!("Free tier unavailable: {e}");
             format!("unavailable — {e}")
         }
-    }
+    };
+    (status, false)
 }
 
 fn print_help() {
